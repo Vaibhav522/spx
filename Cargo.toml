@@ -1,0 +1,13 @@
+[package]
+name = "spx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ffmpeg-sys-next = "8.1.0"
+tempfile = "3.27.0"
+log = "0.4.33"
+crossbeam-queue = "0.3.13"
+tokio-postgres = "0.7.18"
+core_affinity = "0.8.3"
+mimalloc = "0.1.52"
