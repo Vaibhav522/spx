@@ -11,3 +11,5 @@ crossbeam-queue = "0.3.13"
 tokio-postgres = "0.7.18"
 core_affinity = "0.8.3"
 mimalloc = "0.1.52"
+chrono = "0.4.45"
+uuid = { version = "1.23.4", features = ["v4"] }

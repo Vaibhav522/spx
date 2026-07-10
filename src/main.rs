@@ -1,4 +1,5 @@
 mod transcoder;
+mod bucket_allocator;
 
 use transcoder::transcoder;
 
