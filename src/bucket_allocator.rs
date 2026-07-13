@@ -23,7 +23,7 @@ impl BucketEntry {
 }
 
 
-struct BucketAllocator {
+pub struct BucketAllocator {
     bucket_limit: usize,
     output_directory: String,
     output_path: PathBuf,
@@ -111,18 +111,4 @@ impl BucketAllocator {
             .map_err(|_| "Error allocating bucket!")
     }
 
-}
-
-
-fn main() {
-    let max_count: usize = 10000;
-    let output_directory: String = String::from('c');
-
-    let mut bucket_allocator: BucketAllocator = BucketAllocator::new(max_count, output_directory).expect("Failed");
-
-    let allocated_bucket = bucket_allocator.allocate_bucket();
-    
-    if let Ok(bucket) = allocated_bucket {
-        println!("{}", bucket.to_string_lossy());
-    }
 }
