@@ -1,11 +1,13 @@
 use uuid::Uuid;
 use std::path::PathBuf;
 use std::fs::create_dir;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 
 struct BucketEntry {
     bucket_id: String,
     bucket_path: PathBuf,
-    bucket_elements: usize,
+    bucket_elements: AtomicUsize,
 }
 
 impl BucketEntry {
@@ -13,12 +15,16 @@ impl BucketEntry {
         Self {
             bucket_id: bucket_id,
             bucket_path: bucket_path.clone(),
-            bucket_elements: bucket_elements,
+            bucket_elements: AtomicUsize::new(bucket_elements),
         }
     }
     
     pub fn increment_elm(&mut self) {
-        self.bucket_elements += 1;
+        self.bucket_elements.fetch_add(1, Ordering::Acquire);
+    }
+
+    pub fn get_bucket_path(&self) -> PathBuf {
+        return self.bucket_path.clone()
     }
 }
 
@@ -82,33 +88,37 @@ impl BucketAllocator {
         return Ok(1)
     }
 
-    pub fn create_new_bucket(&mut self) -> Result<PathBuf, std::io::Error> {
+    pub fn create_new_bucket(&mut self) -> Result<&mut BucketEntry, Box<dyn std::error::Error>> {
         let bucket_uuid = Uuid::new_v4();
         let bucket_id: String = bucket_uuid.to_string();
 
         let bucket_path: PathBuf = self.output_path.join(&bucket_id);
         create_dir(&bucket_path)?;
-        
-        self.bucket_table.push(
-            BucketEntry::new(
-                bucket_id, 
-                0 as usize,
-                bucket_path.clone()
-            )
+
+        let appending_bucket: BucketEntry = BucketEntry::new(
+            bucket_id, 
+            0 as usize,
+            bucket_path.clone()
         );
-        return Ok(bucket_path.clone())
+
+        self.bucket_table.push(appending_bucket);
+
+        self.bucket_table.last_mut().ok_or_else(|| Box::<dyn std::error::Error>::from("Err"))
     }
 
-    pub fn allocate_bucket(&mut self) -> Result<PathBuf, &'static str> {
-        for bucket in &mut self.bucket_table {
-            if bucket.bucket_elements < self.bucket_limit {
-                bucket.increment_elm();
-                return Ok(bucket.bucket_path.clone());
+    pub fn allocate_bucket(&mut self) -> Result<&mut BucketEntry, &'static str> {
+        for i in 0..self.bucket_table.len() {
+            if self.bucket_table[i].bucket_elements.load(Ordering::Acquire) < self.bucket_limit {
+                return Ok(&mut self.bucket_table[i]);
             }
         }
 
         self.create_new_bucket()
             .map_err(|_| "Error allocating bucket!")
     }
-
 }
+
+
+/* 
+                bucket.increment_elm();
+                return Ok(bucket.bucket_path.clone()); */

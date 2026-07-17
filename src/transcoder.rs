@@ -1,7 +1,7 @@
-use std::ffi::{CStr, CString, c_int};
+use std::ffi::{CStr, CString, OsStr, c_int};
 use std::io::Write;
 use std::os::raw::c_void;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
 
@@ -95,9 +95,8 @@ impl Drop for SampleBufferGuard {
 /// Extracts and transcodes the best (or first English-tagged) audio stream of
 /// `input_file_path` into a mono, 16 kHz, f32 PCM file at `output_file_path`.
 
-pub fn transcoder(input_file_path: &str, output_file_path: &str, _sha: &str) -> Result<(), String> {
-    let target_path = Path::new(input_file_path);
-    let destination_path = Path::new(output_file_path);
+pub fn transcoder(input_file_path: String, destination_path: PathBuf, _sha: &str) -> Result<(), String> {
+    let target_path = Path::new(&input_file_path);
 
     if !target_path.exists() {
         return Err("Target file path doesn't exist!".to_string());
