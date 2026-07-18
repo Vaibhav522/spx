@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString, OsStr, c_int};
+use std::ffi::{CStr, CString, c_int};
 use std::io::Write;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};

@@ -5,8 +5,9 @@ mod queue;
 mod transcoder;
 mod bucket_allocator;
 
+use chrono::Utc;
 use db::DB;
-use queue::JobQueue;
+use queue::{JobQueue, SyncUpdate, JobUpdate};
 use transcoder::transcoder;
 use bucket_allocator::BucketAllocator;
 
@@ -14,6 +15,9 @@ use bucket_allocator::BucketAllocator;
 use dotenvy::dotenv;
 use mimalloc::MiMalloc;
 
+
+
+// Numa affinity implementation using microsoft MiMalloc
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -22,11 +26,13 @@ static GLOBAL: MiMalloc = MiMalloc;
 __config_params__
 
 WORKER__COUNT = usize
-QUEUE__CAPACITY = usize
+WORKER_QUEUE_CAPACITY = usize
 STORAGE__BUCKET__LIMIT = usize
 MAX__JOB__FETCH__ATTEMPT = usize
 OUTPUT__DIRECTORY__PATH = str
 OUTPUT_FILE_EXTENSION = str
+NATS_CONNECTION_URL: str,
+UPDATE_SYNC_THRESHOLD: usize
 
 // Database config
 DB__PG__HOST = str
@@ -42,18 +48,20 @@ DB__PG__POOL__TIMEOUTS__WAIT__NANOS = usize
 use tokio;
 use serde::{Deserialize};
 use config::{Config, ConfigError};
-use std::{fmt::Debug, path::PathBuf, sync::{Arc, atomic::Ordering}, thread};
+use std::{fmt::Debug, mem::transmute, sync::{Arc, atomic::Ordering}, thread};
 
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
     WORKER_COUNT: usize,
-    QUEUE_CAPACITY: usize,
+    WORKER_QUEUE_CAPACITY: usize,
     STORAGE_BUCKET_LIMIT: usize,
     MAX_JOB_FETCH_ATTEMPT: usize,
     OUTPUT_DIRECTORY_PATH: String,
     OUTPUT_FILE_EXTENSION: String,
     NATS_CONNECTION_URL: String,
+
+    UPDATE_SYNC_THRESHOLD: usize,
 }
 
 
@@ -76,20 +84,24 @@ async fn main() {
     // Create a JetStream context.
     let jetstream = async_nats::jetstream::new(nats_client);
 
-    let mut queue = Arc::new(
-        JobQueue::new(
-            app_config.QUEUE_CAPACITY, 
-            db, 
-            app_config.MAX_JOB_FETCH_ATTEMPT,
-            jetstream
-        )
-    );
+    let mut job_queue = Arc::new(JobQueue::initalize(
+        app_config.WORKER_QUEUE_CAPACITY,
+        Arc::clone(&db),
+        app_config.MAX_JOB_FETCH_ATTEMPT,
+        jetstream,
+    ).await?);
+
+    let mut sync_update_queue = Arc::new(SyncUpdate::initalize(
+        app_config.UPDATE_SYNC_THRESHOLD, 
+        Arc::clone(&db), 
+        jetstream
+    ).await?);
 
     let mut bucket_allocator = Arc::new(
         BucketAllocator::new(app_config.STORAGE_BUCKET_LIMIT, app_config.OUTPUT_DIRECTORY_PATH).expect("Failed")
     );
-    
-    
+
+
     let core_ids = core_affinity::get_core_ids().expect("Failed to retrieve core IDs");
     
     if app_config.WORKER_COUNT > core_ids.len() {
@@ -98,39 +110,62 @@ async fn main() {
 
     let output_file_extension = app_config.OUTPUT_FILE_EXTENSION;
 
-    queue.check_job_pull().await;
+    job_queue.check_job_pull().await;
     bucket_allocator.scan_directory();
 
     for i in 0..app_config.WORKER_COUNT {
         let db_clone = Arc::clone(&db);
-        let queue_clone = Arc::clone(&queue);
-        //let nats_client_clone = Arc::clone(&nats_client);
+        let job_queue_clone = Arc::clone(&job_queue);
+        let sync_update_queue_clone = Arc::clone(&sync_update_queue);
         let bucket_allocator_clone = Arc::new(&bucket_allocator);
 
-        thread::spawn(move || {
+        tokio::spawn(async move {
+            // core affinity of workers
             if core_affinity::set_for_current(core_ids[i]) {
-                    loop {
-                        if queue_clone.queue_completed.load(Ordering::Acquire) == true {
-                            break
-                        }
-                        let worker_job = queue_clone.get_job()?;
-                        let allocated_bucket = bucket_allocator_clone.allocate_bucket()?;
-
-                        let allocated_path = allocated_bucket.get_bucket_path();
-                        let file_sha = worker_job.get_file_sha();
-
-                        allocated_path.push(file_sha);
-                        allocated_path.set_extension(output_file_extension);
-
-
-                        if let Ok(transcoded) = transcoder(worker_job.get_target_file_path(), allocated_path, &file_sha) { 
-                            allocated_bucket.increment_elm();
-                            todo!();
-                        } else {
-                            continue
-                        }
+                loop {
+                    if job_queue_clone.queue_completed.load(Ordering::Acquire) == true {
+                        break
                     }
-                    todo!()
+                    let start_time = std::time::SystemTime::now();
+
+                    let worker_job = job_queue_clone.get_job().await?;
+                    let allocated_bucket = bucket_allocator_clone.allocate_bucket()?;
+
+                    let allocated_path = allocated_bucket.get_bucket_path();
+                    let file_sha = worker_job.get_file_sha();
+
+                    allocated_path.push(file_sha);
+                    allocated_path.set_extension(output_file_extension);
+
+                    if let Ok(transcoded) = transcoder(worker_job.get_target_file_path(), allocated_path, &file_sha) { 
+                        let elapsed: std::time::Duration = start_time.elapsed().unwrap();
+                        let output_path = allocated_path.to_str().map(String::from).unwrap();
+
+                        allocated_bucket.increment_elm();
+                        sync_update_queue.enqueue_update(JobUpdate::new(
+                            file_sha,
+                            Some(output_path),
+                            true,
+                            Utc::now(),
+                            transcoded.file_size,
+                            elapsed,
+                            None
+                        )).await;
+                    } else {
+                        let elapsed: std::time::Duration = start_time.elapsed().unwrap();
+
+                        sync_update_queue.enqueue_update(JobUpdate::new(
+                            file_sha,
+                            None, 
+                            false, 
+                            Utc::now(),
+                            None,
+                            elapsed,
+                            Some(String::from("Error while_ transcoding"))
+                        )).await;
+                    }
+                }
+                todo!()
             } else {
                 todo!()
             }
