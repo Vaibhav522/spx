@@ -5,7 +5,7 @@ use serde::Deserialize;
 //use tokio_postgres::types::Date;
 use std::{error::Error, time::SystemTime};
 
-use crate::queue::{Job, JobSource, SyncSource, JobUpdate};
+use crate::queue::{Job, JobSource, JobUpdate, SyncSource};
 
 // Pulls loaded environment variables, and constructs and dead_pool config struct
 
@@ -34,12 +34,11 @@ fn serialize_job(row: &tokio_postgres::Row) -> Result<Vec<u8>, ()> {
     );
 
     if let Ok(serialize_job) = serde_json::to_vec::<Job>(&job) {
-        return Ok(serialize_job)
+        return Ok(serialize_job);
     } else {
-        return Err(())
+        return Err(());
     }
 }
-
 
 impl DB {
     pub fn initalize() -> Result<Self, Box<dyn Error>> {
@@ -56,7 +55,6 @@ impl DB {
         Ok(Self { pool: pool })
     }
 }
-
 
 impl JobSource for DB {
     async fn fetch_job(&self, limit: usize) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
@@ -95,28 +93,24 @@ impl JobSource for DB {
         let stmt = client.prepare_cached(&sql_query).await?;
         let rows = client.query(&stmt, &[]).await?;
 
-
         let mut serialized_rows: Vec<Vec<u8>> = vec![];
 
         for row in rows {
             if let Ok(serialized_row) = serialize_job(&row) {
                 serialized_rows.push(serialized_row);
             } else {
-                continue
+                continue;
             }
         }
         return Ok(serialized_rows);
     }
 }
 
-
-
-
-
-
-
 impl SyncSource for DB {
-    async fn sync_updates(&self, job_updates: Vec<JobUpdate>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn sync_updates(
+        &self,
+        job_updates: Vec<JobUpdate>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut file_sha: Vec<String> = Vec::with_capacity(job_updates.len());
         let mut is_transcoded: Vec<bool> = Vec::with_capacity(job_updates.len());
         let mut error_faced: Vec<Option<String>> = Vec::with_capacity(job_updates.len());
@@ -131,7 +125,7 @@ impl SyncSource for DB {
             is_transcoded.push(job_update.is_transcoded);
             error_faced.push(job_update.error_faced);
             processed_at.push(job_update.processed_at.to_rfc3339());
-            time_to_process.push(job_update.time_to_process.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs_f64());
+            time_to_process.push(job_update.time_to_process.as_secs_f64());
 
             if let Some(file_size) = job_update.output_file_size {
                 output_file_size.push(Some(file_size as i64));
@@ -163,11 +157,24 @@ impl SyncSource for DB {
                 )
             WHERE f.file_sha = sync_updates.file_sha;
         ";
-    
+
         let client = self.pool.get().await?;
         let stmt = client.prepare(sql_query).await?;
-        let update = client.execute(&stmt, &[&file_sha, &output_file_path, &is_transcoded, &error_faced, &processed_at, &output_file_size, &time_to_process]).await?;
+        let update = client
+            .execute(
+                &stmt,
+                &[
+                    &file_sha,
+                    &output_file_path,
+                    &is_transcoded,
+                    &error_faced,
+                    &processed_at,
+                    &output_file_size,
+                    &time_to_process,
+                ],
+            )
+            .await?;
 
-        return Ok(())
+        return Ok(());
     }
 }

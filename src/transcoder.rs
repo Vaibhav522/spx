@@ -95,7 +95,12 @@ impl Drop for SampleBufferGuard {
 /// Extracts and transcodes the best (or first English-tagged) audio stream of
 /// `input_file_path` into a mono, 16 kHz, f32 PCM file at `output_file_path`.
 
-pub fn transcoder(input_file_path: String, destination_path: PathBuf, _sha: &str) -> Result<(), String> {
+pub fn transcoder(
+    input_file_path: String,
+    destination_path: PathBuf,
+    _sha: &str,
+    tmpfile: &mut tempfile::NamedTempFile,
+) -> Result<(), String> {
     let target_path = Path::new(&input_file_path);
 
     if !target_path.exists() {
@@ -280,16 +285,6 @@ pub fn transcoder(input_file_path: String, destination_path: PathBuf, _sha: &str
         // Create the temp file in the same directory as the destination so
         // that `persist()` below is a same-volume rename (Windows/most OSes
         // cannot rename across drives/volumes).
-        let output_dir = destination_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-
-        let mut tmpfile = tempfile::Builder::new()
-            .prefix(".spx-transcode-")
-            .suffix(".tmp")
-            .tempfile_in(output_dir)
-            .map_err(|_| "Couldn't create temp file".to_string())?;
 
         let mut decoded_samples = 0i64;
         let mut written_samples = 0i64;
@@ -437,13 +432,6 @@ pub fn transcoder(input_file_path: String, destination_path: PathBuf, _sha: &str
             "Decoded Frames = {}, Written Frames = {}",
             decoded_samples, written_samples
         );
-
-        tmpfile
-            .flush()
-            .map_err(|_| "Failed to flush temp file".to_string())?;
-        tmpfile
-            .persist(destination_path)
-            .map_err(|e| format!("Failed to persist output file: {e}"))?;
     }
 
     Ok(())

@@ -1,26 +1,22 @@
 extern crate core_affinity;
 
+mod bucket_allocator;
 mod db;
 mod queue;
 mod transcoder;
-mod bucket_allocator;
 
+use bucket_allocator::BucketAllocator;
 use chrono::Utc;
 use db::DB;
-use queue::{JobQueue, SyncUpdate, JobUpdate};
+use queue::{JobQueue, JobUpdate, SyncUpdate};
 use transcoder::transcoder;
-use bucket_allocator::BucketAllocator;
-
 
 use dotenvy::dotenv;
 use mimalloc::MiMalloc;
 
-
-
 // Numa affinity implementation using microsoft MiMalloc
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-
 
 /*
 __config_params__
@@ -36,7 +32,7 @@ UPDATE_SYNC_THRESHOLD: usize
 
 // Database config
 DB__PG__HOST = str
-DB__PG__USER = str 
+DB__PG__USER = str
 DB__PG__PASSWORD = str
 DB__PG__DBNAME = str
 DB__PG__POOL__MAX_SIZE = usize
@@ -45,11 +41,13 @@ DB__PG__POOL__TIMEOUTS__WAIT__NANOS = usize
 
 */
 
-use tokio;
-use serde::{Deserialize};
 use config::{Config, ConfigError};
-use std::{fmt::Debug, mem::transmute, sync::{Arc, atomic::Ordering}, thread};
-
+use serde::Deserialize;
+use std::{
+    fmt::Debug,
+    sync::{Arc, atomic::Ordering},
+};
+use tokio;
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -64,9 +62,10 @@ struct AppConfig {
     UPDATE_SYNC_THRESHOLD: usize,
 }
 
-
 fn load_configs() -> Result<AppConfig, ConfigError> {
-    let config = Config::builder().add_source(config::Environment::default()).build()?;
+    let config = Config::builder()
+        .add_source(config::Environment::default())
+        .build()?;
     config.try_deserialize()
 }
 
@@ -74,38 +73,40 @@ fn load_configs() -> Result<AppConfig, ConfigError> {
 async fn main() {
     dotenv().ok();
     let app_config = load_configs()?;
-    
-    let mut db = Arc::new(
-        DB::initalize()?
-    );
+
+    let mut db = Arc::new(DB::initalize()?);
 
     // initalizing and connecting to nats
     let nats_client = async_nats::connect(app_config.NATS_CONNECTION_URL).await?;
     // Create a JetStream context.
     let jetstream = async_nats::jetstream::new(nats_client);
 
-    let mut job_queue = Arc::new(JobQueue::initalize(
-        app_config.WORKER_QUEUE_CAPACITY,
-        Arc::clone(&db),
-        app_config.MAX_JOB_FETCH_ATTEMPT,
-        jetstream,
-    ).await?);
-
-    let mut sync_update_queue = Arc::new(SyncUpdate::initalize(
-        app_config.UPDATE_SYNC_THRESHOLD, 
-        Arc::clone(&db), 
-        jetstream
-    ).await?);
-
-    let mut bucket_allocator = Arc::new(
-        BucketAllocator::new(app_config.STORAGE_BUCKET_LIMIT, app_config.OUTPUT_DIRECTORY_PATH).expect("Failed")
+    let mut job_queue = Arc::new(
+        JobQueue::initalize(
+            app_config.WORKER_QUEUE_CAPACITY,
+            Arc::clone(&db),
+            app_config.MAX_JOB_FETCH_ATTEMPT,
+            jetstream,
+        )
+        .await?,
     );
 
+    let mut sync_update_queue = Arc::new(
+        SyncUpdate::initalize(app_config.UPDATE_SYNC_THRESHOLD, Arc::clone(&db), jetstream).await?,
+    );
+
+    let mut bucket_allocator = Arc::new(
+        BucketAllocator::initalize(
+            app_config.STORAGE_BUCKET_LIMIT,
+            app_config.OUTPUT_DIRECTORY_PATH,
+        )
+        .expect("Failed"),
+    );
 
     let core_ids = core_affinity::get_core_ids().expect("Failed to retrieve core IDs");
-    
+
     if app_config.WORKER_COUNT > core_ids.len() {
-        return 
+        return;
     }
 
     let output_file_extension = app_config.OUTPUT_FILE_EXTENSION;
@@ -124,7 +125,7 @@ async fn main() {
             if core_affinity::set_for_current(core_ids[i]) {
                 loop {
                     if job_queue_clone.queue_completed.load(Ordering::Acquire) == true {
-                        break
+                        break;
                     }
                     let start_time = std::time::SystemTime::now();
 
@@ -137,32 +138,52 @@ async fn main() {
                     allocated_path.push(file_sha);
                     allocated_path.set_extension(output_file_extension);
 
-                    if let Ok(transcoded) = transcoder(worker_job.get_target_file_path(), allocated_path, &file_sha) { 
+                    let mut tmpfile: tempfile::NamedTempFile = tempfile::NamedTempFile::new()
+                        .map_err(|_: std::io::Error| "{e}".to_string())?;
+
+                    if let Ok(transcoded) = transcoder(
+                        worker_job.get_target_file_path(),
+                        allocated_path,
+                        &file_sha,
+                        &mut tmpfile,
+                    ) {
                         let elapsed: std::time::Duration = start_time.elapsed().unwrap();
+
+                        tmpfile
+                            .flush()
+                            .map_err(|_| "Failed to flush temp file".to_string())?;
+                        tmpfile
+                            .persist(destination_path)
+                            .map_err(|e| format!("Failed to persist output file: {e}"))?;
+
                         let output_path = allocated_path.to_str().map(String::from).unwrap();
 
                         allocated_bucket.increment_elm();
-                        sync_update_queue.enqueue_update(JobUpdate::new(
-                            file_sha,
-                            Some(output_path),
-                            true,
-                            Utc::now(),
-                            transcoded.file_size,
-                            elapsed,
-                            None
-                        )).await;
+                        sync_update_queue
+                            .enqueue_update(JobUpdate::new(
+                                file_sha,
+                                Some(output_path),
+                                true,
+                                Utc::now(),
+                                transcoded.file_size,
+                                elapsed,
+                                None,
+                            ))
+                            .await;
                     } else {
                         let elapsed: std::time::Duration = start_time.elapsed().unwrap();
 
-                        sync_update_queue.enqueue_update(JobUpdate::new(
-                            file_sha,
-                            None, 
-                            false, 
-                            Utc::now(),
-                            None,
-                            elapsed,
-                            Some(String::from("Error while_ transcoding"))
-                        )).await;
+                        sync_update_queue
+                            .enqueue_update(JobUpdate::new(
+                                file_sha,
+                                None,
+                                false,
+                                Utc::now(),
+                                None,
+                                elapsed,
+                                Some(String::from("Error while_ transcoding")),
+                            ))
+                            .await;
                     }
                 }
                 todo!()
@@ -171,10 +192,7 @@ async fn main() {
             }
         });
     }
-
 }
 
 // emsure the worker count is always lesser then core_count.
-// 
-
-
+//
