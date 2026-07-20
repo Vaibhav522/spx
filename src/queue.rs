@@ -180,7 +180,7 @@ impl<S: JobSource> JobQueue<S> {
             self.pending_queued_jobs.fetch_sub(1, Ordering::Acquire);
             job.ack()
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to ack job"))?;
+                .map_err(|_| anyhow::anyhow!("Failed to ack job"))?;
 
             let deserialized = serde_json::from_slice::<Job>(&job.payload)?;
             Ok(deserialized)

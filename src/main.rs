@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -81,11 +82,12 @@ async fn main() -> anyhow::Result<()> {
 
     let file_layer = fmt::layer().json().with_writer(non_blocking);
 
+    tracing_log::LogTracer::init().expect("failed to initialize log tracer");
+
     tracing_subscriber::registry()
         .with(env_filter)
         .with(stderr_layer)
         .with(file_layer)
-        .with(tracing_log::LogTracer::default()) // ← bridge
         .init();
 
     // `_log_guard` MUST be held for the lifetime of the program.
@@ -195,13 +197,10 @@ async fn main() -> anyhow::Result<()> {
 
         handles.spawn(async move {
             // ── Pin to core ───────────────────────────────
-            match core_affinity::set_for_current(core_ids[i]) {
-                Ok(_) => debug!(worker = i, core_id = core_ids[i].id, "pinned"),
-                Err(e) => warn!(
-                    worker = i,
-                    core_id = core_ids[i].id,
-                    "pin failed: {e:#}; running unpinned"
-                ),
+            if core_affinity::set_for_current(core_ids[i]) {
+                debug!(worker = i, core_id = core_ids[i].id, "pinned");
+            } else {
+                return;
             }
 
             info!(worker = i, "worker started");
@@ -311,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
                             output_path.push(&file_sha);
                             output_path.set_extension(&output_ext);
 
-                            if let Err(e) = tmpfile.flush() {
+                            if let Err(e) = tmpfile.as_file_mut().flush() {
                                 warn!("flush: {e}");
                             }
 
@@ -401,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             info!(worker = i, "worker finished");
-            Ok::<_, anyhow::Error>(())
+            return;
         });
     }
 
@@ -413,8 +412,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Wait for all workers ────────────────────────────────────
     while let Some(result) = handles.join_next().await {
         match result {
-            Ok(Ok(())) => debug!("worker joined cleanly"),
-            Ok(Err(e)) => error!("worker exited with error: {e:#}"),
+            Ok(()) => debug!("worker joined cleanly"),
             Err(join_err) => error!("worker panicked: {join_err:#}"),
         }
     }
