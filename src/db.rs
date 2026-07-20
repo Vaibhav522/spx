@@ -1,11 +1,8 @@
-use chrono::Utc;
+use crate::queue::{Job, JobSource, JobUpdate, SyncSource};
+use anyhow::Context;
 use deadpool_postgres::Runtime;
 use deadpool_postgres::*;
 use serde::Deserialize;
-//use tokio_postgres::types::Date;
-use std::{error::Error, time::SystemTime};
-
-use crate::queue::{Job, JobSource, JobUpdate, SyncSource};
 
 // Pulls loaded environment variables, and constructs and dead_pool config struct
 
@@ -41,8 +38,10 @@ fn serialize_job(row: &tokio_postgres::Row) -> Result<Vec<u8>, ()> {
 }
 
 impl DB {
-    pub fn initalize() -> Result<Self, Box<dyn Error>> {
-        let cfg: DBConfig = DBConfig::from_env()?;
+    pub fn initalize() -> anyhow::Result<Self> {
+        let cfg: DBConfig = DBConfig::from_env().context(
+            "Faced error when trying to extract needed db config environment variables!",
+        )?;
 
         // tls configuration
         let config = rustls::ClientConfig::builder()
@@ -50,14 +49,17 @@ impl DB {
             .with_no_client_auth();
         let tls = tokio_postgres_rustls::MakeRustlsConnect::new(config);
 
-        let pool = cfg.pg.create_pool(Some(Runtime::Tokio1), tls)?;
+        let pool = cfg
+            .pg
+            .create_pool(Some(Runtime::Tokio1), tls)
+            .context("Error initializing db pool!")?;
 
         Ok(Self { pool: pool })
     }
 }
 
 impl JobSource for DB {
-    async fn fetch_job(&self, limit: usize) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    async fn fetch_job(&self, limit: usize) -> anyhow::Result<Vec<Vec<u8>>> {
         let sql_query = format!(
             "
                 WITH jobs AS (
@@ -89,9 +91,19 @@ impl JobSource for DB {
                     f.file_name, f.file_sha; -- Returns data directly to your application              
         ", limit);
 
-        let client = self.pool.get().await?;
-        let stmt = client.prepare_cached(&sql_query).await?;
-        let rows = client.query(&stmt, &[]).await?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Error trying to get a db pool object!")?;
+        let stmt = client
+            .prepare_cached(&sql_query)
+            .await
+            .context("Error preparing job pull sql statement for Job Pull!")?;
+        let rows = client
+            .query(&stmt, &[])
+            .await
+            .context("Error pulling jobs from db!")?;
 
         let mut serialized_rows: Vec<Vec<u8>> = vec![];
 
@@ -107,10 +119,7 @@ impl JobSource for DB {
 }
 
 impl SyncSource for DB {
-    async fn sync_updates(
-        &self,
-        job_updates: Vec<JobUpdate>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn sync_updates(&self, job_updates: Vec<JobUpdate>) -> anyhow::Result<()> {
         let mut file_sha: Vec<String> = Vec::with_capacity(job_updates.len());
         let mut is_transcoded: Vec<bool> = Vec::with_capacity(job_updates.len());
         let mut error_faced: Vec<Option<String>> = Vec::with_capacity(job_updates.len());
@@ -158,9 +167,16 @@ impl SyncSource for DB {
             WHERE f.file_sha = sync_updates.file_sha;
         ";
 
-        let client = self.pool.get().await?;
-        let stmt = client.prepare(sql_query).await?;
-        let update = client
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("Error trying to get a db pool object!")?;
+        let stmt = client
+            .prepare(sql_query)
+            .await
+            .context("Error preparing sync update sql statement!")?;
+        client
             .execute(
                 &stmt,
                 &[
@@ -173,7 +189,8 @@ impl SyncSource for DB {
                     &time_to_process,
                 ],
             )
-            .await?;
+            .await
+            .context("Error syncing updates to db!")?;
 
         return Ok(());
     }

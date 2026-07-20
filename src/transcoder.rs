@@ -1,10 +1,11 @@
 use std::ffi::{CStr, CString, c_int};
 use std::io::Write;
 use std::os::raw::c_void;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 use std::slice;
 
+use anyhow::Context;
 use ffmpeg_sys_next::{
     AV_CH_LAYOUT_MONO, AVChannelLayout, AVChannelOrder, AVCodec, AVCodecContext, AVCodecParameters,
     AVERROR, AVERROR_EOF, AVFormatContext, AVFrame, AVMediaType, AVPacket, AVSampleFormat,
@@ -92,28 +93,30 @@ impl Drop for SampleBufferGuard {
     }
 }
 
+// Transcoder metadata
+
+pub struct TranscoderMetadata {
+    pub input_sample_rate: usize,
+    pub resampled_file_size: usize,
+}
+
 /// Extracts and transcodes the best (or first English-tagged) audio stream of
 /// `input_file_path` into a mono, 16 kHz, f32 PCM file at `output_file_path`.
 
 pub fn transcoder(
     input_file_path: String,
-    destination_path: PathBuf,
-    _sha: &str,
     tmpfile: &mut tempfile::NamedTempFile,
-) -> Result<(), String> {
+) -> anyhow::Result<TranscoderMetadata> {
     let target_path = Path::new(&input_file_path);
 
     if !target_path.exists() {
-        return Err("Target file path doesn't exist!".to_string());
-    }
-    if destination_path.exists() {
-        return Err("Processed File already exists!".to_string());
+        return Err(anyhow::anyhow!("Target file path doesn't exist!"));
     }
 
     unsafe {
         // casting rust string to cstring
-        let c_target_path = CString::new(input_file_path)
-            .map_err(|_| "Input path contains a NUL byte".to_string())?;
+        let c_target_path =
+            CString::new(input_file_path).context("Input path contains a NUL byte")?;
 
         // ---- open input & probe streams -----------------------------------
         let mut format_context_ptr: *mut AVFormatContext = ptr::null_mut();
@@ -124,13 +127,15 @@ pub fn transcoder(
             ptr::null_mut(),
         );
         if result < 0 {
-            return Err("Failed to initialize avformat & open input file!".to_string());
+            return Err(anyhow::anyhow!(
+                "Failed to initialize avformat & open input file!"
+            ));
         }
         let format_guard = FormatContextGuard(format_context_ptr);
 
         // stream info
         if avformat_find_stream_info(format_context_ptr, ptr::null_mut()) < 0 {
-            return Err("Failed to find stream info!".to_string());
+            return Err(anyhow::anyhow!("Failed to find stream info!"));
         }
 
         // total stream count and selected stream
@@ -172,7 +177,7 @@ pub fn transcoder(
                 0,
             );
             if best_stream_search < 0 {
-                return Err("Unable to find best audio stream!".to_string());
+                return Err(anyhow::anyhow!("Unable to find suitable audio stream!"));
             }
             selected_stream_index = best_stream_search;
         }
@@ -185,20 +190,22 @@ pub fn transcoder(
         // ---- decoder setup --------------------------------------------------
         let codec: *const AVCodec = avcodec_find_decoder((*codec_par).codec_id);
         if codec.is_null() {
-            return Err("Error finding the decoder codec!".to_string());
+            return Err(anyhow::anyhow!("Error finding the proper decoder codec!"));
         }
 
         let decoder_context_ptr: *mut AVCodecContext = avcodec_alloc_context3(codec);
         if decoder_context_ptr.is_null() {
-            return Err("Failed to allocate decoder context!".to_string());
+            return Err(anyhow::anyhow!("Failed to allocate decoder context!"));
         }
         let decoder_guard = CodecContextGuard(decoder_context_ptr);
 
         if avcodec_parameters_to_context(decoder_context_ptr, codec_par) < 0 {
-            return Err("Failed to copy codec parameters to decoder context!".to_string());
+            return Err(anyhow::anyhow!(
+                "Failed to copy codec parameters for decoder context"
+            ));
         }
         if avcodec_open2(decoder_context_ptr, codec, ptr::null_mut()) < 0 {
-            return Err("Failed to open decoder!".to_string());
+            return Err(anyhow::anyhow!("Failed to initalize decoder context!"));
         }
 
         // ---- resampler setup -------------------------------------------------
@@ -224,7 +231,9 @@ pub fn transcoder(
         if input_channel_layout.order == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC {
             let nb_channels = (*codec_par).ch_layout.nb_channels;
             if nb_channels <= 0 {
-                return Err("Invalid number of channels in input".to_string());
+                return Err(anyhow::anyhow!(
+                    "Invalid number of channels in the target file!"
+                ));
             }
             ffmpeg_sys_next::av_channel_layout_default(&mut input_channel_layout, nb_channels);
         }
@@ -247,7 +256,7 @@ pub fn transcoder(
         );
 
         if swr_opts < 0 {
-            return Err("Failed to create SWR context!".to_string());
+            return Err(anyhow::anyhow!("Failed to create the SWR context!"));
         }
 
         let swr_guard = SwrContextGuard(swr_context);
@@ -266,19 +275,19 @@ pub fn transcoder(
         av_opt_set_int(swr_context as *mut c_void, exact_rational.as_ptr(), 1, 0);
 
         if ffmpeg_sys_next::swr_init(swr_context) < 0 {
-            return Err("Failed to initialize SWR context!".to_string());
+            return Err(anyhow::anyhow!("Failed to initialize SWR context!"));
         }
 
         // ---- packet/frame scratch space --------------------------------------
         let packet_ptr: *mut AVPacket = av_packet_alloc();
         if packet_ptr.is_null() {
-            return Err("Failed to allocate packet!".to_string());
+            return Err(anyhow::anyhow!("Failed to allocate packet context!"));
         }
         let packet_guard = PacketGuard(packet_ptr);
 
         let frame_ptr: *mut AVFrame = av_frame_alloc();
         if frame_ptr.is_null() {
-            return Err("Failed to allocate frame!".to_string());
+            return Err(anyhow::anyhow!("Failed to allocate frame context!"));
         }
         let frame_guard = FrameGuard(frame_ptr);
 
@@ -286,8 +295,8 @@ pub fn transcoder(
         // that `persist()` below is a same-volume rename (Windows/most OSes
         // cannot rename across drives/volumes).
 
-        let mut decoded_samples = 0i64;
-        let mut written_samples = 0i64;
+        // let mut decoded_samples = 0i64;
+        // let mut written_samples = 0i64;
         let mut total_bytes = 0u64;
 
         // ---- decode / resample / write loop ----------------------------------
@@ -300,7 +309,9 @@ pub fn transcoder(
             // FIX: Proper error handling
             let send_ret = avcodec_send_packet(decoder_context_ptr, packet_guard.0);
             if send_ret < 0 && send_ret != AVERROR(EAGAIN) {
-                return Err(format!("Error sending packet to decoder: {}", send_ret));
+                return Err(anyhow::anyhow!(
+                    "Error transferring packets to decoder context!"
+                ));
             }
 
             loop {
@@ -309,13 +320,15 @@ pub fn transcoder(
                 if ret == AVERROR(EAGAIN) || ret == AVERROR_EOF {
                     break;
                 } else if ret < 0 {
-                    return Err("Error receiving decoded frame".to_string());
+                    return Err(anyhow::anyhow!(
+                        "Error fetching decoded frames from decoder!"
+                    ));
                 }
 
                 let nb_samples: c_int =
                     ffmpeg_sys_next::swr_get_out_samples(swr_context, (*frame_guard.0).nb_samples);
                 if nb_samples < 0 {
-                    return Err("Failed to compute output sample count".to_string());
+                    return Err(anyhow::anyhow!("Failed to output sample counts"));
                 }
 
                 let align: c_int = 0;
@@ -331,7 +344,7 @@ pub fn transcoder(
                     align,
                 );
                 if alloc_ret < 0 || audio_data.is_null() {
-                    return Err("Failed to allocate output sample buffer".to_string());
+                    return Err(anyhow::anyhow!("Failed to allocate output sample buffer"));
                 }
                 let sample_buffer_guard = SampleBufferGuard(audio_data);
 
@@ -352,11 +365,12 @@ pub fn transcoder(
 
                     tmpfile
                         .write_all(raw_bytes)
-                        .map_err(|_| "Failed writing to temp file".to_string())?;
+                        .context("Failed writing to temp file")?;
 
                     total_bytes += raw_bytes.len() as u64;
-                    decoded_samples += (*frame_guard.0).nb_samples as i64;
-                    written_samples += total_output_samples as i64;
+
+                    // decoded_samples += (*frame_guard.0).nb_samples as i64;
+                    // written_samples += total_output_samples as i64;
                 }
 
                 drop(sample_buffer_guard);
@@ -391,7 +405,7 @@ pub fn transcoder(
                 align,
             );
             if alloc_ret < 0 || audio_data.is_null() {
-                return Err("Failed to allocate output sample buffer".to_string());
+                return Err(anyhow::anyhow!("Failed to allocate output sample buffer"));
             }
             let sample_buffer_guard = SampleBufferGuard(audio_data);
 
@@ -403,7 +417,7 @@ pub fn transcoder(
                 let raw_bytes = slice::from_raw_parts(*audio_data as *const u8, valid_bytes);
                 tmpfile
                     .write_all(raw_bytes)
-                    .map_err(|_| "Failed writing to temp file".to_string())?;
+                    .context("Failed writing to temp file")?;
             } else {
                 // Nothing more to drain; avoid spinning forever if swr keeps
                 // reporting a stale non-zero estimate.
@@ -423,7 +437,18 @@ pub fn transcoder(
         drop(decoder_guard);
         drop(format_guard);
 
-        println!("total_bytes = {}", total_bytes);
+        let metadata = TranscoderMetadata {
+            input_sample_rate: input_sample_rate as usize,
+            resampled_file_size: total_bytes as usize,
+        };
+
+        return Ok(metadata);
+    }
+}
+
+/*
+
+println!("total_bytes = {}", total_bytes);
         println!(
             "tempfile bytes = {}",
             tmpfile.as_file().metadata().unwrap().len()
@@ -432,7 +457,5 @@ pub fn transcoder(
             "Decoded Frames = {}, Written Frames = {}",
             decoded_samples, written_samples
         );
-    }
 
-    Ok(())
-}
+*/
