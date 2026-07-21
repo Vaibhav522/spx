@@ -1,6 +1,6 @@
-use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex;
 
 use anyhow::Context;
 use chrono::Utc;
@@ -17,12 +17,14 @@ use serde::Deserialize;
 mod bucket_allocator;
 mod db;
 mod queue;
-mod transcoder;
+mod resampler;
+mod temp_allocator;
 
 use bucket_allocator::BucketAllocator;
 use db::DB;
 use queue::{JobQueue, JobUpdate, SyncUpdate};
-use transcoder::transcoder;
+use resampler::resampler;
+use temp_allocator::TempHolder;
 
 // ─── Allocator ────────────────────────────────────────────────────
 
@@ -33,14 +35,14 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
-    WORKER_COUNT: usize,
-    WORKER_QUEUE_CAPACITY: usize,
-    STORAGE_BUCKET_LIMIT: usize,
-    MAX_JOB_FETCH_ATTEMPT: usize,
-    OUTPUT_DIRECTORY_PATH: String,
-    OUTPUT_FILE_EXTENSION: String,
-    NATS_CONNECTION_URL: String,
-    UPDATE_SYNC_THRESHOLD: usize,
+    worker_count: usize,
+    worker_queue_capacity: usize,
+    storage_bucket_limit: usize,
+    max_job_fetch_attempt: usize,
+    output_directory_path: String,
+    output_file_extension: String,
+    nats_connection_url: String,
+    update_sync_threshold: usize,
 }
 
 fn load_configs() -> Result<AppConfig, ConfigError> {
@@ -52,8 +54,12 @@ fn load_configs() -> Result<AppConfig, ConfigError> {
 
 // ─── main ─────────────────────────────────────────────────────────
 
+fn main() {
+    todo!()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn dbs() -> anyhow::Result<()> {
     // ── Bootstrap: env + tracing ──────────────────────────────
     dotenv().ok();
 
@@ -97,11 +103,11 @@ async fn main() -> anyhow::Result<()> {
     // ── Config ────────────────────────────────────────────────
     let app_config = load_configs()?;
     info!(
-        workers = app_config.WORKER_COUNT,
-        queue_cap = app_config.WORKER_QUEUE_CAPACITY,
-        bucket_limit = app_config.STORAGE_BUCKET_LIMIT,
-        output_dir = %app_config.OUTPUT_DIRECTORY_PATH,
-        output_ext = %app_config.OUTPUT_FILE_EXTENSION,
+        workers = app_config.worker_count,
+        queue_cap = app_config.worker_queue_capacity,
+        bucket_limit = app_config.storage_bucket_limit,
+        output_dir = %app_config.output_directory_path,
+        output_ext = %app_config.output_file_extension,
         "starting spx transcoder"
     );
 
@@ -110,8 +116,8 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(DB::initalize()?);
 
     // ── NATS ──────────────────────────────────────────────────
-    info!(url = %app_config.NATS_CONNECTION_URL, "connecting to NATS");
-    let nats_client = async_nats::connect(&app_config.NATS_CONNECTION_URL)
+    info!(url = %app_config.nats_connection_url, "connecting to NATS");
+    let nats_client: async_nats::Client = async_nats::connect(&app_config.nats_connection_url)
         .await
         .context("Failed to connect to NATS")?;
     let jetstream = async_nats::jetstream::new(nats_client);
@@ -120,9 +126,9 @@ async fn main() -> anyhow::Result<()> {
     info!("initializing job queue (NATS-backed)");
     let job_queue = Arc::new(
         JobQueue::initalize(
-            app_config.WORKER_QUEUE_CAPACITY,
+            app_config.worker_queue_capacity,
             Arc::clone(&db),
-            app_config.MAX_JOB_FETCH_ATTEMPT,
+            app_config.max_job_fetch_attempt,
             jetstream.clone(),
         )
         .await?,
@@ -130,22 +136,22 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Sync-update queue ─────────────────────────────────────
     info!(
-        threshold = app_config.UPDATE_SYNC_THRESHOLD,
+        threshold = app_config.update_sync_threshold,
         "initializing sync-update queue"
     );
     let sync_update_queue = Arc::new(
-        SyncUpdate::initalize(app_config.UPDATE_SYNC_THRESHOLD, Arc::clone(&db), jetstream).await?,
+        SyncUpdate::initalize(app_config.update_sync_threshold, Arc::clone(&db), jetstream).await?,
     );
 
     // ── Bucket allocator ──────────────────────────────────────
     info!(
-        limit = app_config.STORAGE_BUCKET_LIMIT,
-        dir = %app_config.OUTPUT_DIRECTORY_PATH,
+        limit = app_config.storage_bucket_limit,
+        dir = %app_config.output_directory_path,
         "initializing bucket allocator"
     );
     let mut bucket_allocator = BucketAllocator::initalize(
-        app_config.STORAGE_BUCKET_LIMIT,
-        app_config.OUTPUT_DIRECTORY_PATH,
+        app_config.storage_bucket_limit,
+        app_config.output_directory_path,
     )?;
 
     bucket_allocator
@@ -158,20 +164,20 @@ async fn main() -> anyhow::Result<()> {
     // ── Core affinity ─────────────────────────────────────────
     let core_ids = core_affinity::get_core_ids().context("Failed to retrieve core IDs")?;
 
-    if app_config.WORKER_COUNT > core_ids.len() {
+    if app_config.worker_count > core_ids.len() {
         error!(
-            workers = app_config.WORKER_COUNT,
+            workers = app_config.worker_count,
             cores = core_ids.len(),
             "worker count exceeds available cores"
         );
         anyhow::bail!(
             "WORKER_COUNT ({}) exceeds available cores ({})",
-            app_config.WORKER_COUNT,
+            app_config.worker_count,
             core_ids.len()
         );
     }
     info!(
-        workers = app_config.WORKER_COUNT,
+        workers = app_config.worker_count,
         cores = core_ids.len(),
         "core affinity plan"
     );
@@ -183,16 +189,16 @@ async fn main() -> anyhow::Result<()> {
         info!("initial job pull complete");
     }
 
-    let output_ext = app_config.OUTPUT_FILE_EXTENSION;
+    let output_ext = app_config.output_file_extension;
 
     // ── Spawn workers ─────────────────────────────────────────
     let mut handles = JoinSet::new();
 
-    for i in 0..app_config.WORKER_COUNT {
-        let db = Arc::clone(&db);
+    for i in 0..app_config.worker_count {
+        let core_ids = core_ids.clone();
         let job_queue = Arc::clone(&job_queue);
         let sync_update_queue = Arc::clone(&sync_update_queue);
-        let bucket_allocator = Arc::clone(&bucket_allocator);
+        let bucket_allocator_clone = Arc::clone(&bucket_allocator);
         let output_ext = output_ext.clone();
 
         handles.spawn(async move {
@@ -240,11 +246,53 @@ async fn main() -> anyhow::Result<()> {
                 async {
                     debug!(input = %input_path, "got job");
 
-                    // ── Temp file ─────────────────────────
-                    let mut tmpfile = match tempfile::NamedTempFile::new() {
-                        Ok(f) => f,
+                    let mut temp_holder =
+                        match TempHolder::new(file_sha.clone(), output_ext.clone()) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                error!("tempfile: {e}");
+                                sync_update_queue
+                                    .enqueue_update(JobUpdate::new(
+                                        file_sha.clone(),
+                                        None,
+                                        false,
+                                        Utc::now(),
+                                        None,
+                                        start.elapsed(),
+                                        Some(format!("tempfile: {e}")),
+                                    ))
+                                    .await
+                                    .ok();
+                                return;
+                            }
+                        };
+
+                    // ── Transcode ─────────────────────────
+                    debug!("transcoding…");
+
+                    // take a cloned, owned File so we don't move a borrow out of temp_holder
+                    let temp_file = match temp_holder.get_holder() {
+                        Ok(f) => match f.try_clone() {
+                            Ok(cloned) => cloned,
+                            Err(e) => {
+                                error!("clone tempfile: {e}");
+                                sync_update_queue
+                                    .enqueue_update(JobUpdate::new(
+                                        file_sha.clone(),
+                                        None,
+                                        false,
+                                        Utc::now(),
+                                        None,
+                                        start.elapsed(),
+                                        Some(format!("tempfile clone: {e}")),
+                                    ))
+                                    .await
+                                    .ok();
+                                return;
+                            }
+                        },
                         Err(e) => {
-                            error!("tempfile: {e}");
+                            error!("get_holder: {e}");
                             sync_update_queue
                                 .enqueue_update(JobUpdate::new(
                                     file_sha.clone(),
@@ -261,107 +309,50 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
-                    // ── Transcode ─────────────────────────
-                    debug!("transcoding…");
-
                     let transcode_result = {
-                        let input_path = input_path.clone();
-                        tokio::task::spawn_blocking(move || transcoder(input_path, &mut tmpfile))
-                            .await
+                        tokio::task::spawn_blocking(move || {
+                            let mut temp_file = temp_file;
+                            resampler(input_path.clone(), &mut temp_file)
+                        })
+                        .await
                     };
-
                     let elapsed = start.elapsed();
 
                     match transcode_result {
-                        Ok(Ok(metadata)) => {
-                            debug!(
-                                size = metadata.resampled_file_size,
-                                elapsed_ms = elapsed.as_millis(),
-                                "transcode ok"
-                            );
-
-                            // ── Allocate bucket ───────────
-                            let mut allocator = bucket_allocator
-                                .lock()
-                                .expect("bucket_allocator lock poisoned");
-
-                            let bucket = match allocator.allocate_bucket() {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    drop(allocator);
-                                    error!("allocate_bucket: {e:#}");
-                                    sync_update_queue
-                                        .enqueue_update(JobUpdate::new(
-                                            file_sha.clone(),
-                                            None,
-                                            false,
-                                            Utc::now(),
-                                            None,
-                                            elapsed,
-                                            Some(format!("allocate_bucket: {e}")),
-                                        ))
-                                        .await
-                                        .ok();
-                                    return;
-                                }
-                            };
-
-                            let mut output_path = bucket.get_bucket_path();
-                            output_path.push(&file_sha);
-                            output_path.set_extension(&output_ext);
-
-                            if let Err(e) = tmpfile.as_file_mut().flush() {
-                                warn!("flush: {e}");
+                        Ok(Ok(metadata)) => match temp_holder
+                            .persist(Arc::clone(&bucket_allocator_clone))
+                            .await
+                        {
+                            Ok(output_path_str) => {
+                                sync_update_queue
+                                    .enqueue_update(JobUpdate::new(
+                                        file_sha,
+                                        Some(output_path_str),
+                                        true,
+                                        Utc::now(),
+                                        Some(metadata.resampled_file_size as usize),
+                                        elapsed,
+                                        None,
+                                    ))
+                                    .await
+                                    .ok();
                             }
-
-                            match tmpfile.persist(&output_path) {
-                                Ok(_) => {
-                                    bucket.increment_elm();
-                                    drop(allocator);
-
-                                    let output_str = output_path
-                                        .to_str()
-                                        .map(String::from)
-                                        .unwrap_or_else(|| output_path.display().to_string());
-
-                                    info!(
-                                        output = %output_str,
-                                        size = metadata.resampled_file_size,
-                                        elapsed_ms = elapsed.as_millis(),
-                                        "job completed"
-                                    );
-
-                                    sync_update_queue
-                                        .enqueue_update(JobUpdate::new(
-                                            file_sha,
-                                            Some(output_str),
-                                            true,
-                                            Utc::now(),
-                                            Some(metadata.resampled_file_size as usize),
-                                            elapsed,
-                                            None,
-                                        ))
-                                        .await
-                                        .ok();
-                                }
-                                Err(e) => {
-                                    error!(path = %output_path.display(), "persist: {e:#}");
-                                    sync_update_queue
-                                        .enqueue_update(JobUpdate::new(
-                                            file_sha,
-                                            None,
-                                            false,
-                                            Utc::now(),
-                                            None,
-                                            elapsed,
-                                            Some(format!("persist: {e}")),
-                                        ))
-                                        .await
-                                        .ok();
-                                }
+                            Err(e) => {
+                                error!(elapsed_ms = elapsed.as_millis(), "transcode: {e:#}");
+                                sync_update_queue
+                                    .enqueue_update(JobUpdate::new(
+                                        file_sha,
+                                        None,
+                                        false,
+                                        Utc::now(),
+                                        None,
+                                        elapsed,
+                                        Some(format!("{e:#}")),
+                                    ))
+                                    .await
+                                    .ok();
                             }
-                        }
-
+                        },
                         Ok(Err(e)) => {
                             error!(elapsed_ms = elapsed.as_millis(), "transcode: {e:#}");
                             sync_update_queue
@@ -377,7 +368,6 @@ async fn main() -> anyhow::Result<()> {
                                 .await
                                 .ok();
                         }
-
                         Err(join_err) => {
                             error!("spawn_blocking panicked: {join_err:#}");
                             sync_update_queue
@@ -393,7 +383,7 @@ async fn main() -> anyhow::Result<()> {
                                 .await
                                 .ok();
                         }
-                    }
+                    };
                 }
                 .instrument(job_span)
                 .await;
@@ -405,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!(
-        count = app_config.WORKER_COUNT,
+        count = app_config.worker_count,
         "all workers spawned; waiting…"
     );
 

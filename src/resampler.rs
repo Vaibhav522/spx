@@ -95,7 +95,7 @@ impl Drop for SampleBufferGuard {
 
 // Transcoder metadata
 
-pub struct TranscoderMetadata {
+pub struct ResamplerMetadata {
     pub input_sample_rate: usize,
     pub resampled_file_size: usize,
 }
@@ -103,10 +103,10 @@ pub struct TranscoderMetadata {
 /// Extracts and transcodes the best (or first English-tagged) audio stream of
 /// `input_file_path` into a mono, 16 kHz, f32 PCM file at `output_file_path`.
 
-pub fn transcoder(
+pub fn resampler(
     input_file_path: String,
-    tmpfile: &mut tempfile::NamedTempFile,
-) -> anyhow::Result<TranscoderMetadata> {
+    tmpfile: &mut std::fs::File,
+) -> anyhow::Result<ResamplerMetadata> {
     let target_path = Path::new(&input_file_path);
 
     if !target_path.exists() {
@@ -437,7 +437,7 @@ pub fn transcoder(
         drop(decoder_guard);
         drop(format_guard);
 
-        let metadata = TranscoderMetadata {
+        let metadata = ResamplerMetadata {
             input_sample_rate: input_sample_rate as usize,
             resampled_file_size: total_bytes as usize,
         };
@@ -447,7 +447,7 @@ pub fn transcoder(
 }
 
 /*
-
+Debug dead codes??
 println!("total_bytes = {}", total_bytes);
         println!(
             "tempfile bytes = {}",

@@ -1,3 +1,5 @@
 /target
 .env
 implementation-logic.md
+
+setup.sh

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use anyhow::Context;
 
-struct BucketEntry {
+pub struct BucketEntry {
     bucket_id: String,
     bucket_path: PathBuf,
     bucket_elements: AtomicUsize,
@@ -20,7 +20,7 @@ impl BucketEntry {
         }
     }
 
-    pub fn increment_elm(&mut self) {
+    pub fn increment_elm(&self) {
         self.bucket_elements.fetch_add(1, Ordering::Acquire);
     }
 
@@ -39,6 +39,10 @@ pub struct BucketAllocator {
 impl BucketAllocator {
     pub fn initalize(bucket_limit: usize, output_directory: String) -> anyhow::Result<Self> {
         let output_path = PathBuf::from(output_directory.clone());
+
+        if !output_path.exists() {
+            create_dir(output_path.clone()).context("Failed to create output directory!")?;
+        }
 
         return Ok(Self {
             bucket_limit: bucket_limit,
@@ -85,7 +89,7 @@ impl BucketAllocator {
         return Ok(());
     }
 
-    pub fn create_new_bucket(&mut self) -> anyhow::Result<&mut BucketEntry> {
+    pub fn create_new_bucket(&mut self) -> anyhow::Result<&BucketEntry> {
         let bucket_uuid = Uuid::new_v4();
         let bucket_id: String = bucket_uuid.to_string();
 
@@ -97,14 +101,14 @@ impl BucketAllocator {
 
         self.bucket_table.push(appending_bucket);
         self.bucket_table
-            .last_mut()
+            .last()
             .ok_or_else(|| anyhow::anyhow!("Error providing bucket: table is empty"))
     }
 
-    pub fn allocate_bucket(&mut self) -> anyhow::Result<&mut BucketEntry> {
+    pub fn allocate_bucket(&mut self) -> anyhow::Result<&BucketEntry> {
         for i in 0..self.bucket_table.len() {
             if self.bucket_table[i].bucket_elements.load(Ordering::Acquire) < self.bucket_limit {
-                return Ok(&mut self.bucket_table[i]);
+                return Ok(&self.bucket_table[i]);
             }
         }
         self.create_new_bucket()
