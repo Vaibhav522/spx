@@ -54,12 +54,8 @@ fn load_configs() -> Result<AppConfig, ConfigError> {
 
 // ─── main ─────────────────────────────────────────────────────────
 
-fn main() {
-    todo!()
-}
-
 #[tokio::main]
-async fn dbs() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<()> {
     // ── Bootstrap: env + tracing ──────────────────────────────
     dotenv().ok();
 

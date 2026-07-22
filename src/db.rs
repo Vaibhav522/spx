@@ -25,7 +25,7 @@ pub struct DB {
 
 fn serialize_job(row: &tokio_postgres::Row) -> Result<Vec<u8>, ()> {
     let job = Job::new(
-        row.get("input_file_path"),
+        row.get("file_path"),
         row.get("file_sha"),
         Some(chrono::Utc::now()),
     );
@@ -88,8 +88,10 @@ impl JobSource for DB {
                 WHERE 
                     f.file_sha = j.file_sha -- Using a Join-Update (much faster than IN clause)
                 RETURNING 
-                    f.file_name, f.file_sha; -- Returns data directly to your application              
-        ", limit);
+                    f.file_path, f.file_sha; -- Returns data directly to your application              
+        ",
+            limit
+        );
 
         let client = self
             .pool
